@@ -1,0 +1,34 @@
+# Simulation
+*.log
+*.jou
+*.wdb
+*.vcd
+*.fsdb
+*.vpd
+
+# Vivado
+.cache/
+.hw/
+.ip_user_files/
+.runs/
+
+# Verdi
+novas.conf
+verdiLog/
+
+# VCS
+csrc/
+simv*
+ucli.key
+DVEfiles/
+
+# Python
+__pycache__/
+*.pyc
+
+# VSCode
+.vscode/
+
+# Windows
+Thumbs.db
+Desktop.ini
