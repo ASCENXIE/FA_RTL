@@ -1,367 +1,353 @@
-# DMAEngine SPEC
-
-## 状态
-
-本文档定义当前 Flash Attention 加速器中 `fa_dma_engine` 的规格说明。  
-它基于当前已经收敛的 `16x16` 单 shared core 架构，并与 `TOP_SPEC`、`Scheduler_SPEC`、`AddrGen_SPEC`、`BufferCluster_SPEC`、`VPU_SPEC` 的接口和行为保持一致。
+# `fa_dma_engine` 规格说明
 
 ## 1. 模块概述
 
-`fa_dma_engine` 是系统中的**tile 级 DMA 执行器与 AXI 协议适配器**。
+`fa_dma_engine` 是 Flash Attention 加速器中的 tile 级 DMA 执行模块与 AXI Master 协议适配模块。
 
-它负责：
+该模块接收上游 `fa_scheduler` 或地址生成/调度逻辑给出的单次 DMA 请求，根据请求中的 `dma_op`、`dma_addr` 和 `dma_bytes` 完成一次 tile 级搬运操作。对于 Q/K/V 输入 tile，DMA 从外部内存读取数据并写入 `buffer_cluster`；对于 O 输出 tile，DMA 从已经存放 O 结果的输出 buffer 读取数据，并写回外部内存。
 
-- 读取外存中的 `Q/K/V tile`
-- 将读回的数据以流形式交给 `buffer_cluster`
-- 接收来自 `VPU` 的最终 `O tile`
-- 将 `O tile` 写回外存
+`fa_dma_engine` 不负责生成 Q/K/V/O 的具体地址，也不保存 Q/K/V/O 的 base address。Q/K/V/O 地址的选择由上游 `scheduler`、`addr_gen` 或 CSR 配置路径完成。DMA 只执行当前被发起的单个 `dma_op` 请求。
 
-`fa_dma_engine` 不负责：
+`fa_dma_engine` 不直接接收计算通路的 O 输出流。计算通路应先将 O tile 写入输出 buffer，并在 O tile 可写回后通知 `scheduler`。随后由 `scheduler` 发起 `DMA_STORE_O` 请求，DMA 再从输出 buffer 读取 O tile 并写回外存。
 
-- 生成 tile 地址
-- 决定下一步搬运哪个 tile
-- 管理 buffer bank 切换
-- 进行任何 attention 数值计算
+baseline 设计中，`fa_dma_engine` 采用单实例、单 issue 模型。同一时刻只接受并执行一个 tile 级 DMA 请求。
 
-从职责上看，它是一个：
+## 2. 接口说明
 
-> **面向 tile 级任务的 DMA 读写执行模块，对外保持 tile 抽象，对内完成 AXI burst/beat 级协议处理**
+### 2.1 时钟与复位
 
-## 2. 模块核心职责
+| 信号名 | 方向 | 位宽 | 说明 |
+|---|---:|---:|---|
+| `clk` | input | 1 | DMA 模块工作时钟。控制逻辑、buffer 访问接口和 AXI Master 接口均同步于该时钟。 |
+| `rst_n` | input | 1 | 低有效复位。复位内部状态、锁存的请求参数、计数器和输出状态。 |
 
-`fa_dma_engine` 的核心职责如下：
+### 2.2 Scheduler 请求接口
 
-1. 接收来自 `fa_scheduler` 的 tile 级 DMA 请求：
-   - `dma_start`
-   - `dma_op`
-   - `dma_addr`
-   - `dma_bytes`
-2. 根据 `dma_op` 执行以下操作之一：
-   - `DMA_LOAD_Q`
-   - `DMA_LOAD_K`
-   - `DMA_LOAD_V`
-   - `DMA_STORE_O`
-3. 对读操作：
-   - 发起 AXI 读请求
-   - 接收读回数据
-   - 通过 `dma_w_*` 流接口把数据送入 `buffer_cluster`
-4. 对写操作：
-   - 从 `o_stream_*` 接收最终 `O tile`
-   - 必要时先写入内部写回缓冲
-   - 发起 AXI 写事务并提交到外存
-5. 在单 tile 请求超过单个 AXI burst 能力时：
-   - 在模块内部自动拆分为多个连续 burst
-6. 对外以：
-   - `busy`
-   - `done`
-   - `error`
-   表示当前 tile 级 DMA 任务状态
+该接口用于接收上游发起的单次 tile 级 DMA 请求。
 
-## 3. 子模块概述
+| 信号名 | 方向 | 位宽 | 说明 |
+|---|---:|---:|---|
+| `start` | input | 1 | 启动一次 DMA 请求。`start` 为单周期脉冲，仅在 `busy == 0` 时被接受。 |
+| `dma_op` | input | 2 | DMA 操作类型，编码见第 4.1 节。 |
+| `dma_addr` | input | `MEM_ADDR_WIDTH` | 当前 DMA 请求的外部内存起始地址。DMA 不解释该地址属于 Q、K、V 还是 O，只按 `dma_op` 执行。 |
+| `dma_bytes` | input | `DMA_BYTES_WIDTH` | 当前 DMA 请求的总传输字节数。 |
+| `busy` | output | 1 | 当前 DMA 请求正在执行。 |
+| `done` | output | 1 | 当前 DMA 请求正常完成的单周期脉冲。 |
+| `error` | output | 1 | 错误状态。发生 AXI 响应异常、非法参数或协议检查失败后置 1，并保持到复位。 |
 
-虽然 `fa_dma_engine` 可以实现成一个 RTL 模块，但逻辑上建议拆分为以下几个子块：
+### 2.3 写入 `buffer_cluster` 的读回接口
 
-| 子模块 | 子模块功能 |
-|---|---|
-| `dma_req_latch` | 锁存 tile 级 DMA 请求：`dma_op / dma_addr / dma_bytes`。 |
-| `dma_read_ctrl` | 管理 `LOAD_Q/K/V` 的 AXI 读地址、读数据接收和 beat 计数。 |
-| `dma_write_ctrl` | 管理 `STORE_O` 的 AXI 写地址、写数据发送和写响应处理。 |
-| `dma_burst_splitter` | 把 tile 级请求拆分成多个 AXI burst（若需要）。 |
-| `dma_read_stream_if` | 将 AXI 读回数据组织为 `dma_w_*` 输出给 `buffer_cluster`。 |
-| `dma_write_stream_if` | 从 `o_stream_*` 接收数据并组织为 AXI 写数据流。 |
-| `dma_wb_buffer` | 保存至少 1 个 `O tile` 深度的内部写回缓冲/FIFO。 |
-| `dma_status_ctrl` | 生成 `busy/done/error`，管理任务完成和错误状态。 |
+该接口只在 `DMA_LOAD_Q`、`DMA_LOAD_K` 和 `DMA_LOAD_V` 请求中有效，用于把从外部内存读回的数据交付给 `buffer_cluster`。
 
-## 4. 子模块功能说明
+| 信号名 | 方向 | 位宽 | 说明 |
+|---|---:|---:|---|
+| `buf_w_valid` | output | 1 | 写入 `buffer_cluster` 的数据有效。 |
+| `buf_w_ready` | input | 1 | `buffer_cluster` 可以接收当前 beat。 |
+| `buf_w_kind` | output | `BUF_KIND_WIDTH` | 当前 beat 的数据类别，由 `dma_op` 派生，取值为 `BUF_Q`、`BUF_K` 或 `BUF_V`。 |
+| `buf_w_data` | output | `DMA_DATA_WIDTH` | 写入 `buffer_cluster` 的数据。 |
+| `buf_w_last` | output | 1 | 当前 tile 的最后一个 beat。该信号是 tile-level last，不是 AXI burst-level last。 |
 
-| 子模块 | 核心状态/信号 | 功能说明 |
-|---|---|---|
-| `dma_req_latch` | `dma_op_latched`, `dma_addr_latched`, `dma_bytes_latched` | 在接受 `start` 时锁存本次 tile 级请求参数。 |
-| `dma_read_ctrl` | `is_read_op`, `ar_issue`, `r_beat_cnt` | 执行 `LOAD_Q/K/V` 的 AXI 读路径。 |
-| `dma_write_ctrl` | `is_write_op`, `aw_issue`, `w_beat_cnt`, `b_wait` | 执行 `STORE_O` 的 AXI 写路径。 |
-| `dma_burst_splitter` | `burst_addr`, `burst_bytes`, `burst_beats` | 当单 tile 超过单 burst 能力时，内部自动拆分多个 burst。 |
-| `dma_read_stream_if` | `dma_w_valid/data/last`, `dma_w_ready` | 把读回数据流式交付给 `buffer_cluster`。 |
-| `dma_write_stream_if` | `o_stream_valid/data/last`, `o_stream_ready` | 从 `VPU` 接收最终 `O tile`。 |
-| `dma_wb_buffer` | `wb_fifo`, `wb_count` | 解耦 `VPU_FINALIZE_O` 输出和 AXI 写回节奏。 |
-| `dma_status_ctrl` | `busy`, `done`, `error` | 统一管理任务生命周期与异常结束。 |
+### 2.4 O 输出 buffer 读接口
 
-## 5. 工作粒度与资源模型
+该接口只在 `DMA_STORE_O` 请求中有效，用于从已经写好的 O 输出 buffer 读取数据。DMA 不直接连接计算通路的 O 输出流，也不判断 O tile 是否已经计算完成；该依赖关系由 `scheduler` 保证。
 
-`fa_dma_engine` 的工作粒度固定为：
+| 信号名 | 方向 | 位宽 | 说明 |
+|---|---:|---:|---|
+| `o_buf_r_en` | output | 1 | DMA 向 O 输出 buffer 发起一次读请求。 |
+| `o_buf_r_addr` | output | `O_BUF_ADDR_WIDTH` | O 输出 buffer 的 beat 地址或 word index。baseline 中从 0 开始按 beat 递增。 |
+| `o_buf_r_data` | input | `DMA_DATA_WIDTH` | 从 O 输出 buffer 读出的数据。 |
+| `o_buf_r_valid` | input | 1 | `o_buf_r_data` 有效。对于固定读延迟 SRAM，可由 buffer 侧根据读延迟生成。 |
 
-- **tile 级**
+说明：如果实际实现中的 O buffer 与 Q/K/V buffer 统一在 `buffer_cluster` 内部，以上端口可以映射为 `buffer_cluster` 的 O buffer read port。若系统存在多 bank O buffer，bank 选择应由 `scheduler/buffer_cluster` 在 DMA 外部管理，或作为后续版本的扩展字段加入；baseline DMA 顶层不定义独立的 `o_bank_id`。
 
-资源模型固定为：
+### 2.5 AXI Master 写接口
 
-- 单实例
-- 单 issue
-- 单时刻只执行一个 tile 级 DMA 操作
+| 信号名 | 方向 | 位宽 | 说明 |
+|---|---:|---:|---|
+| `m_axi_awaddr` | output | `MEM_ADDR_WIDTH` | AXI 写地址。 |
+| `m_axi_awlen` | output | 8 | AXI 写 burst 长度，表示 beat 数减 1。 |
+| `m_axi_awsize` | output | 3 | AXI 写 beat 大小编码，baseline 固定为 `log2(DMA_DATA_WIDTH/8)`。 |
+| `m_axi_awburst` | output | 2 | AXI 写 burst 类型，baseline 固定为 `INCR`。 |
+| `m_axi_awvalid` | output | 1 | AXI 写地址有效。 |
+| `m_axi_awready` | input | 1 | AXI 写地址就绪。 |
+| `m_axi_wdata` | output | `DMA_DATA_WIDTH` | AXI 写数据。 |
+| `m_axi_wstrb` | output | `DMA_DATA_WIDTH/8` | AXI 写字节使能。baseline 合法请求中所有 beat 均为全字节有效。 |
+| `m_axi_wlast` | output | 1 | 当前 AXI 写 burst 的最后一个 beat。 |
+| `m_axi_wvalid` | output | 1 | AXI 写数据有效。 |
+| `m_axi_wready` | input | 1 | AXI 写数据就绪。 |
+| `m_axi_bresp` | input | 2 | AXI 写响应。 |
+| `m_axi_bvalid` | input | 1 | AXI 写响应有效。 |
+| `m_axi_bready` | output | 1 | AXI 写响应就绪。 |
 
-即：
+### 2.6 AXI Master 读接口
 
-- 不支持同时处理多个 tile 级请求
-- 不在 baseline 中暴露读写双 issue 逻辑通道
+| 信号名 | 方向 | 位宽 | 说明 |
+|---|---:|---:|---|
+| `m_axi_araddr` | output | `MEM_ADDR_WIDTH` | AXI 读地址。 |
+| `m_axi_arlen` | output | 8 | AXI 读 burst 长度，表示 beat 数减 1。 |
+| `m_axi_arsize` | output | 3 | AXI 读 beat 大小编码，baseline 固定为 `log2(DMA_DATA_WIDTH/8)`。 |
+| `m_axi_arburst` | output | 2 | AXI 读 burst 类型，baseline 固定为 `INCR`。 |
+| `m_axi_arvalid` | output | 1 | AXI 读地址有效。 |
+| `m_axi_arready` | input | 1 | AXI 读地址就绪。 |
+| `m_axi_rdata` | input | `DMA_DATA_WIDTH` | AXI 读数据。 |
+| `m_axi_rresp` | input | 2 | AXI 读响应。 |
+| `m_axi_rlast` | input | 1 | 当前 AXI 读 burst 的最后一个 beat。 |
+| `m_axi_rvalid` | input | 1 | AXI 读数据有效。 |
+| `m_axi_rready` | output | 1 | AXI 读数据就绪。 |
 
-## 6. 顶层端口说明
+## 3. 功能行为
 
-| 端口名 | 端口方向 | 端口位宽 | 端口功能 |
-|---|---|---:|---|
-| `clk` | input | 1 | DMA 模块工作时钟 |
-| `rst_n` | input | 1 | 低有效复位 |
-| `start` | input | 1 | 启动一次 tile 级 DMA 请求 |
-| `dma_op` | input | 2 | DMA 操作类型：`LOAD_Q/K/V/STORE_O` |
-| `dma_addr` | input | `MEM_ADDR_WIDTH` | 当前 tile 的外存起始地址 |
-| `dma_bytes` | input | `DMA_BYTES_WIDTH` | 当前 tile 的总传输字节数 |
-| `busy` | output | 1 | 当前 tile 级 DMA 任务执行中 |
-| `done` | output | 1 | 当前 tile 级 DMA 任务完整完成 |
-| `error` | output | 1 | 当前 tile 级 DMA 任务失败 |
-| `buf_w_valid` | output | 1 | 写入 `buffer_cluster` 的数据有效 |
-| `buf_w_kind` | output | `BUF_KIND_WIDTH` | 当前写入数据属于 `Q/K/V` 哪一类 |
-| `buf_w_data` | output | `DMA_DATA_WIDTH` | 写入 `buffer_cluster` 的数据 |
-| `buf_w_last` | output | 1 | 当前 tile 写入 `buffer_cluster` 的最后一个 beat |
-| `buf_w_ready` | input | 1 | `buffer_cluster` 写入就绪 |
-| `o_stream_valid` | input | 1 | 来自 `VPU` 的 `O tile` 输出有效 |
-| `o_stream_data` | input | `DMA_DATA_WIDTH` | 来自 `VPU` 的 `O tile` 输出数据 |
-| `o_stream_last` | input | 1 | `O tile` 最后一个输出 beat |
-| `o_stream_ready` | output | 1 | DMA 对 `O tile` 输入就绪 |
-| `m_axi_awaddr` | output | `MEM_ADDR_WIDTH` | AXI 写地址 |
-| `m_axi_awlen` | output | 8 | AXI 写 burst 长度 |
-| `m_axi_awsize` | output | 3 | AXI 写 burst beat 大小编码 |
-| `m_axi_awburst` | output | 2 | AXI 写 burst 类型 |
-| `m_axi_awvalid` | output | 1 | AXI 写地址有效 |
-| `m_axi_awready` | input | 1 | AXI 写地址就绪 |
-| `m_axi_wdata` | output | `DMA_DATA_WIDTH` | AXI 写数据 |
-| `m_axi_wstrb` | output | `DMA_DATA_WIDTH/8` | AXI 写字节使能 |
-| `m_axi_wlast` | output | 1 | AXI 写 burst 最后一个 beat |
-| `m_axi_wvalid` | output | 1 | AXI 写数据有效 |
-| `m_axi_wready` | input | 1 | AXI 写数据就绪 |
-| `m_axi_bresp` | input | 2 | AXI 写响应 |
-| `m_axi_bvalid` | input | 1 | AXI 写响应有效 |
-| `m_axi_bready` | output | 1 | AXI 写响应就绪 |
-| `m_axi_araddr` | output | `MEM_ADDR_WIDTH` | AXI 读地址 |
-| `m_axi_arlen` | output | 8 | AXI 读 burst 长度 |
-| `m_axi_arsize` | output | 3 | AXI 读 burst beat 大小编码 |
-| `m_axi_arburst` | output | 2 | AXI 读 burst 类型 |
-| `m_axi_arvalid` | output | 1 | AXI 读地址有效 |
-| `m_axi_arready` | input | 1 | AXI 读地址就绪 |
-| `m_axi_rdata` | input | `DMA_DATA_WIDTH` | AXI 读数据 |
-| `m_axi_rresp` | input | 2 | AXI 读响应 |
-| `m_axi_rlast` | input | 1 | AXI 读 burst 最后一个 beat |
-| `m_axi_rvalid` | input | 1 | AXI 读数据有效 |
-| `m_axi_rready` | output | 1 | AXI 读数据就绪 |
+### 3.1 DMA 请求模型
 
-## 7. `dma_op` 语义
+`fa_dma_engine` 的基本工作单位是一次 tile 级 DMA 请求。一次请求由以下输入描述：
 
-`dma_op[1:0]` 建议编码如下：
+```text
+start + dma_op + dma_addr + dma_bytes
+```
 
-| 编码 | 含义 |
-|---|---|
-| `2'b00` | `DMA_LOAD_Q` |
-| `2'b01` | `DMA_LOAD_K` |
-| `2'b10` | `DMA_LOAD_V` |
-| `2'b11` | `DMA_STORE_O` |
+当 `start` 在空闲状态下为 1 时，模块接受请求，锁存 `dma_op`、`dma_addr` 和 `dma_bytes`，并开始执行。当前请求完成或出错前，锁存值保持不变。
 
-## 8. 任务锁存语义
+`fa_dma_engine` 不决定 Q/K/V/O 的搬运顺序。典型系统中，`scheduler` 会按算法需要依次发起若干请求，例如：
 
-在接受 `start` 时，`fa_dma_engine` 必须锁存：
+```text
+DMA_LOAD_Q  @ q_tile_addr
+DMA_LOAD_K  @ k_tile_addr
+DMA_LOAD_V  @ v_tile_addr
+DMA_STORE_O @ o_tile_addr
+```
 
-- `dma_op`
-- `dma_addr`
-- `dma_bytes`
+对 DMA 而言，上述四次是四个独立请求。DMA 顶层接口不展开 `q_addr`、`k_addr`、`v_addr`、`o_addr`。
 
-在当前 tile 级任务完成之前，这些锁存值保持不变。
+对于 `DMA_STORE_O`，`scheduler` 必须保证对应 O tile 已经由计算通路写入 O 输出 buffer，并且在 DMA 写回期间该 O buffer 内容保持稳定。
 
-## 9. 读任务语义
+### 3.2 请求接受与状态语义
 
-读类任务包括：
+`start` 只在 `busy == 0` 且 `error == 0` 时被接受。
+
+当请求被接受后：
+
+- `busy` 置 1；
+- `done` 保持为 0；
+- DMA 根据锁存的 `dma_op` 选择外存读路径或 O buffer 写回路径；
+- 新的 `start` 在 `busy == 1` 时被忽略。
+
+当请求正常完成后：
+
+- `busy` 清 0；
+- `done` 拉高 1 个周期；
+- `error` 保持为 0。
+
+当请求失败后：
+
+- `busy` 清 0；
+- `done` 不产生；
+- `error` 置 1 并保持到 `rst_n` 复位。
+
+### 3.3 读请求语义
+
+读类请求包括：
 
 - `DMA_LOAD_Q`
 - `DMA_LOAD_K`
 - `DMA_LOAD_V`
 
-### 9.1 目标
+读请求的目标是从 `dma_addr` 开始读取连续的 `dma_bytes` 字节，并通过 `buf_w_*` 接口交付给 `buffer_cluster`。
 
-- 从外存读取一个完整 tile
-- 通过 `buf_w_*` 接口送入 `buffer_cluster`
+读请求行为如下：
 
-### 9.2 `buf_w_kind`
+- DMA 发起一个或多个 AXI 读 burst。
+- AXI 读回的每个 beat 按顺序通过 `buf_w_data` 输出。
+- `buf_w_kind` 由 `dma_op` 决定：`LOAD_Q` 输出 `BUF_Q`，`LOAD_K` 输出 `BUF_K`，`LOAD_V` 输出 `BUF_V`。
+- 只有 `buf_w_valid && buf_w_ready` 为 1 时，该 beat 才算成功交付。
+- `buf_w_last` 只在当前 tile 的最后一个成功交付 beat 上拉高。
 
-`buf_w_kind` 只对读类任务有效：
+读请求的 `done` 条件是：
 
-- `LOAD_Q -> Q`
-- `LOAD_K -> K`
-- `LOAD_V -> V`
+> 当前请求的最后一个读回 beat 已经成功通过 `buf_w_*` 交付给 `buffer_cluster`，并且所有相关 AXI 读响应均为 `OKAY`。
 
-在 `STORE_O` 时，`buf_w_kind` 无意义。
+因此，读请求的 `done` 不得早于数据进入 `buffer_cluster`。
 
-### 9.3 完成条件
+### 3.4 写请求语义
 
-读类任务的 `done` 定义为：
-
-> 当前 tile 的最后一个读回 beat 已成功通过 `buf_w_*` 交付给 `buffer_cluster`
-
-也就是不只要求 AXI 读回结束，还要求数据已成功进入 `buffer_cluster`。
-
-## 10. 写任务语义
-
-写类任务只有：
+写类请求只有：
 
 - `DMA_STORE_O`
 
-### 10.1 目标
+写请求的目标是从 O 输出 buffer 读取连续的 `dma_bytes` 字节，并从 `dma_addr` 开始写回外部内存。
 
-- 从 `o_stream_*` 接收完整 `O tile`
-- 通过 AXI 写回外存
+写请求行为如下：
 
-### 10.2 写回缓冲
+- `DMA_STORE_O` 被接受时，DMA 认为目标 O tile 已经完整存放在 O 输出 buffer 中。
+- DMA 通过 `o_buf_r_en/o_buf_r_addr` 按 beat 顺序读取 O buffer。
+- `o_buf_r_addr` 从当前 tile 的起始 beat index 开始，baseline 中为 0，并随成功读取的 beat 递增。
+- 当 `o_buf_r_valid == 1` 时，`o_buf_r_data` 被 DMA 接收，并按顺序写入 AXI 写通道。
+- DMA 必须根据 AXI 写通道背压控制 O buffer 读请求节奏，不能因为 `m_axi_wready` 低而丢失已读出的 O 数据。
+- 写请求的 tile 结束位置由 `dma_bytes` 和内部 beat 计数确定，不依赖外部 `last` 信号。
 
-`fa_dma_engine` 必须包含：
+写请求的 `done` 条件是：
 
-- 至少 **1 个 `O tile` 深度** 的内部写回缓冲/FIFO
+> 当前请求对应的全部 O buffer beat 均已被 DMA 读取，并且所有 AXI 写事务均收到 `OKAY` 写响应。
 
-用于解耦：
+因此，写请求的 `done` 不得早于外部内存写提交完成。
 
-- `VPU_FINALIZE_O` 的输出节奏
-- AXI 写回节奏
+### 3.5 AXI burst 行为
 
-### 10.3 完成条件
+`fa_dma_engine` 对上游保持 tile 级请求抽象，对 AXI 总线使用 burst 事务完成传输。
 
-写类任务的 `done` 定义为：
+baseline AXI 行为如下：
 
-> 最后一个 `o_stream` beat 已成功接收，且 AXI 写事务已提交完成
+- 只使用 `INCR` burst。
+- `ARSIZE/AWSIZE` 固定对应 `DMA_DATA_WIDTH/8` 字节。
+- 单个 burst 最大长度不超过 256 beat。
+- 当 `dma_bytes` 超过单个 burst 能力时，DMA 内部自动拆分为多个连续 burst。
+- 如果请求跨越 AXI 4KB 边界，DMA 必须在 4KB 边界处拆分 burst，不发起跨 4KB 边界的单个 burst。
+- burst 拆分对 `scheduler`、`addr_gen`、`buffer_cluster` 和计算通路均不可见。
+- `m_axi_rlast/m_axi_wlast` 表示 AXI burst 的最后一个 beat；`buf_w_last` 表示读入 tile 请求的最后一个 beat；`DMA_STORE_O` 的 tile 结束由 `dma_bytes` 计数确定。
 
-因此 `done` 不得早于 AXI 写提交完成。
-
-## 11. 连续 tile 布局约束
-
-当前 baseline 中，`fa_dma_engine` 只支持：
-
-> **tile 在外存中连续可搬运**
-
-即要求：
+baseline 只支持 full-beat 对齐传输：
 
 ```text
-stride_bytes == HEAD_DIM * ELEM_BYTES
+dma_addr 按 DMA_DATA_WIDTH/8 字节对齐
+dma_bytes > 0
+dma_bytes 是 DMA_DATA_WIDTH/8 的整数倍
 ```
 
-也就是说：
+如果请求参数不满足上述约束，模块应进入错误状态，不应发起部分有效 beat 的 AXI 访问。
 
-- 当前不支持带 padding 的逐行跨 stride tile 搬运
-- 不支持逐行 micro-burst 跳 stride 访问
+### 3.6 背压与数据保持
 
-这个约束与当前 `AddrGen` 的单 `dma_addr + dma_bytes` 模型一致。
+`buf_w_*` 采用标准 `valid/ready` 握手语义。O buffer 读接口采用请求/有效返回语义。
 
-## 12. AXI burst 拆分语义
+对读请求：
 
-虽然对上层 DMA 请求是 tile 级的，但 DMA 内部必须支持：
+- 当 `buf_w_valid == 1` 且 `buf_w_ready == 0` 时，DMA 必须保持当前 `buf_w_data`、`buf_w_kind` 和 `buf_w_last` 不变，直到握手成功。
+- DMA 可以通过拉低 `m_axi_rready` 或使用内部缓冲处理 `buffer_cluster` 的背压。
 
-> **将单个 tile 级请求自动拆分为多个 AXI burst**
+对写请求：
 
-当：
+- DMA 只能在自身有能力保存返回数据时发起 `o_buf_r_en`。
+- 一旦 `o_buf_r_valid == 1`，对应 `o_buf_r_data` 必须被 DMA 保留，并最终写入 AXI 写通道。
+- 当 AXI 写通道背压较强时，DMA 应暂停继续读取 O buffer，或使用内部缓冲吸收已读出的数据。
 
-- `dma_bytes` 超过单个 AXI burst 能力
+DMA 必须保证背压不会导致数据丢失、重复或乱序。
 
-时，内部自动拆分多个连续 burst。
+### 3.7 错误与复位语义
 
-这种拆分：
+`error` 是保持型状态。以下情况会使 `error` 置 1：
 
-- 对 `scheduler` 不可见
-- 对 `addr_gen` 不可见
-- 对上层完全透明
+- 任意 AXI 读 beat 的 `RRESP` 不是 `OKAY`；
+- 任意 AXI 写响应 `BRESP` 不是 `OKAY`；
+- AXI 读 burst 的 `RLAST` 与内部 beat 计数不一致；
+- O buffer 返回数据数量与 `dma_bytes` 推导出的 beat 数不一致；
+- `dma_op` 编码非法；
+- `dma_addr` 或 `dma_bytes` 不满足 baseline 对齐约束。
 
-## 13. 流接口语义
+发生错误后，当前请求失败，`busy` 清 0，`done` 不应产生。`error` 保持为 1，直到 `rst_n` 被拉低复位。
 
-### 13.1 读回送 `buffer_cluster`
+当 `rst_n` 被拉低时：
 
-`buf_w_*` 严格遵守：
+- 当前 DMA 请求被丢弃；
+- 锁存的 `dma_op/dma_addr/dma_bytes` 被清空；
+- 内部 burst/beat 计数器被清空；
+- 读写执行状态回到空闲；
+- `busy = 0`；
+- `done = 0`；
+- `error = 0`；
+- `buf_w_valid = 0`；
+- `o_buf_r_en = 0`；
+- 所有 AXI `valid` 输出为 0。
 
-- `valid`
-- `ready`
-- `last`
+## 4. 操作编码与参数
 
-规则：
+### 4.1 `dma_op` 编码
 
-- 只有 `valid & ready` 才算该 beat 成功交付
-- `last` 标记当前 tile 的最后一个写入 beat
+`dma_op[1:0]` 编码如下。
 
-### 13.2 从 `VPU` 接收 `O`
+| 编码 | 名称 | 类型 | 说明 |
+|---|---|---|---|
+| `2'b00` | `DMA_LOAD_Q` | read | 从 `dma_addr` 读取 Q tile，并以 `BUF_Q` 写入 `buffer_cluster`。 |
+| `2'b01` | `DMA_LOAD_K` | read | 从 `dma_addr` 读取 K tile，并以 `BUF_K` 写入 `buffer_cluster`。 |
+| `2'b10` | `DMA_LOAD_V` | read | 从 `dma_addr` 读取 V tile，并以 `BUF_V` 写入 `buffer_cluster`。 |
+| `2'b11` | `DMA_STORE_O` | write | 从 O 输出 buffer 读取 O tile，并写回 `dma_addr`。 |
 
-`o_stream_*` 严格遵守：
+### 4.2 参数
 
-- `valid`
-- `ready`
-- `last`
+| 参数名 | 说明 |
+|---|---|
+| `MEM_ADDR_WIDTH` | 外部内存地址宽度。 |
+| `DMA_DATA_WIDTH` | AXI 数据宽度，同时也是 `buf_w_data` 和 `o_buf_r_data` 的宽度。 |
+| `DMA_BYTES_WIDTH` | `dma_bytes` 的位宽。 |
+| `BUF_KIND_WIDTH` | `buf_w_kind` 的位宽。 |
+| `O_BUF_ADDR_WIDTH` | O 输出 buffer 读地址宽度。 |
+| `MAX_BURST_BEATS` | 单个 AXI burst 的最大 beat 数，baseline 不超过 256。 |
 
-规则：
+### 4.3 布局约束
 
-- 只有 `valid & ready` 才算该 beat 成功接收
-- `last` 标记当前 `O tile` 的最后一个输出 beat
+baseline 中，一个 DMA 请求只描述一段连续外部内存区域：
 
-## 14. 内部读写路径区分
+```text
+[dma_addr, dma_addr + dma_bytes)
+```
 
-虽然对外是一个统一 DMA 模块，但内部应显式区分：
+因此 baseline 不支持以下访问模式：
 
-- 读任务执行路径
-- 写任务执行路径
+- 带 padding 的二维 tile 逐行跨 stride 搬运；
+- 每行单独 micro-burst 的跳 stride 访问；
+- 非连续 scatter/gather 访问；
+- byte-level partial beat 搬运。
 
-也就是说实现上建议有独立的：
+如果系统需要支持带 stride 的 tile，应该由上游 `addr_gen/scheduler` 拆成多个连续 DMA 请求，或者在后续版本中扩展 DMA 请求接口。
 
-- 读状态机
-- 写状态机语义
+## 5. 接口字段补充说明
 
-但这种区分不需要额外暴露到顶层接口。
+### 5.1 `start`、`busy` 与 `done`
 
-## 15. 错误语义
+`start` 是请求发起脉冲，不是保持型配置位。DMA 只在空闲且无错误状态下接受 `start`。
 
-`error` 定义为：
+`busy` 是当前请求执行中的状态信号。`busy == 1` 时，上游不应修改当前请求相关输入并再次发起 `start`。
 
-> 当前 tile 级 DMA 任务失败的锁存信号
+`done` 是单周期完成脉冲。若系统需要软件可轮询的保持型完成状态，应由 DMA 外部状态逻辑锁存 `done`，并通过 CSR 清除。
 
-触发来源包括：
+### 5.2 `dma_addr` 与 `dma_op`
 
-- AXI 读响应异常
-- AXI 写响应异常
-- 关键 AXI 通道协议错误
+`dma_addr` 是当前请求的外存起始地址。DMA 不根据地址判断其属于 Q/K/V/O。
 
-一旦发生：
+Q/K/V/O 的语义由 `dma_op` 表达：
 
-- 当前任务失败
-- 进入错误态
-- `error` 保持为 1
+- 对 `DMA_LOAD_Q/K/V`，`dma_addr` 是输入 tile 的读取地址；
+- 对 `DMA_STORE_O`，`dma_addr` 是输出 tile 的写回地址。
 
-baseline 中 `done` 不应与错误完成混淆。
+### 5.3 `buf_w_kind`
 
-## 16. Reset 语义
+`buf_w_kind` 只在读类请求中有效。它由 `dma_op` 派生，用于告诉 `buffer_cluster` 当前读回数据应写入 Q、K 还是 V 相关 buffer。
 
-reset 到来时：
+在 `DMA_STORE_O` 请求中，`buf_w_valid` 必须为 0，`buf_w_kind` 无意义。
 
-- 立即丢弃当前 tile 级 DMA 任务
-- 清空：
-  - `dma_op` latch
-  - `dma_addr` latch
-  - `dma_bytes` latch
-  - beat / burst 计数器
-  - 读写执行状态
-- 回到 idle
+### 5.4 O 输出 buffer 读接口
 
-输出恢复到：
+O tile 的产生和存储不属于 `fa_dma_engine` 的职责。计算通路应先把完整 O tile 写入 O 输出 buffer；当该 tile 可写回时，计算通路或 buffer 控制逻辑通知 `scheduler`，再由 `scheduler` 发起 `DMA_STORE_O`。
 
-- `busy = 0`
-- `done = 0`
-- `error = 0`
-- `buf_w_valid = 0`
-- `m_axi_*valid = 0`
+`DMA_STORE_O` 执行期间，DMA 通过 `o_buf_r_en/o_buf_r_addr` 主动读取 O buffer。O buffer 侧通过 `o_buf_r_valid/o_buf_r_data` 返回数据。DMA 不接收 `o_stream_valid/o_stream_ready/o_stream_last` 形式的计算输出流。
 
-## 17. 总结
+### 5.5 `last` 信号
 
-`fa_dma_engine` 是当前系统中的 tile 级 DMA 执行器与 AXI 协议适配器：
+`buf_w_last` 表示当前读入 tile 请求的最后一个交付给 `buffer_cluster` 的数据 beat。
 
-- tile 级请求
-- tile 级完成
-- 单实例、单 issue
-- 读侧把 `Q/K/V` 送入 `buffer_cluster`
-- 写侧从 `VPU` 接收最终 `O`
-- 内部负责 burst 切分与 AXI 协议细节
-- baseline 只支持连续 tile 布局
+AXI 的 `m_axi_rlast/m_axi_wlast` 表示当前 AXI burst 的最后一个 beat。一个 tile 请求可能拆分为多个 AXI burst，因此 tile-level last 与 burst-level last 不能混用。
 
-这份规格定义了当前实现阶段稳定的 `DMAEngine` 接口与行为边界。
+`DMA_STORE_O` 不依赖外部 `last` 输入。写回 tile 的最后一个 beat 由 `dma_bytes` 和内部计数器确定。
+
+## 6. 系统集成模型
+
+典型执行流程如下：
+
+1. 上游 CSR/地址生成逻辑根据软件配置得到 Q/K/V/O 的 tile 地址。
+2. `scheduler` 在 DMA 空闲时发起 `DMA_LOAD_Q` 请求，传入当前 Q tile 的 `dma_addr` 和 `dma_bytes`。
+3. DMA 从外存读取 Q tile，并以 `BUF_Q` 写入 `buffer_cluster`，完成后产生 `done`。
+4. `scheduler` 继续发起 `DMA_LOAD_K` 和 `DMA_LOAD_V` 请求。
+5. 计算通路使用 `buffer_cluster` 中的 Q/K/V 数据完成计算，并将最终 O tile 写入 O 输出 buffer。
+6. O tile 写入完成后，计算通路或 O buffer 控制逻辑通知 `scheduler`。
+7. `scheduler` 在确认 O tile 已经可写回后，发起 `DMA_STORE_O` 请求，传入 O tile 的外存写回地址和字节数。
+8. DMA 从 O 输出 buffer 读取 O tile，并通过 AXI 写回外存，写响应正常返回后产生 `done`。
+
+`fa_dma_engine` 只保证单个请求内的数据搬运正确性和 AXI 协议适配。多次请求之间的顺序、依赖关系、buffer bank 选择、O tile 可写回判断和 tile 调度策略由 `scheduler` 及其上游控制逻辑负责。
