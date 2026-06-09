@@ -1,5 +1,5 @@
 # DMAEngine
-../RTL/DMAEngine/tb_dma_top.v
+../tb/tb_dma_top.v
 ../RTL/DMAEngine/dma_top.v
 ../RTL/DMAEngine/dma_csr.v
 ../RTL/DMAEngine/axi_write_out.v
