@@ -1,0 +1,115 @@
+{
+  "hardware": {
+    "len_seq": 256,
+    "head_dim": 64,
+    "Br": 16,
+    "Bc": 16,
+    "causal": false,
+    "saturate": true,
+    "use_rounding": true,
+    "exp_clamp_min_real": -16.0,
+    "formats": {
+      "q_fmt": {
+        "name": "Q8.8",
+        "signed": true,
+        "total_bits": 16,
+        "frac_bits": 8
+      },
+      "k_fmt": {
+        "name": "Q8.8",
+        "signed": true,
+        "total_bits": 16,
+        "frac_bits": 8
+      },
+      "v_fmt": {
+        "name": "Q8.8",
+        "signed": true,
+        "total_bits": 16,
+        "frac_bits": 8
+      },
+      "out_fmt": {
+        "name": "Q8.8",
+        "signed": true,
+        "total_bits": 16,
+        "frac_bits": 8
+      },
+      "prod_qk_fmt": {
+        "name": "Q16.16",
+        "signed": true,
+        "total_bits": 32,
+        "frac_bits": 16
+      },
+      "s_fmt": {
+        "name": "Q22.16",
+        "signed": true,
+        "total_bits": 38,
+        "frac_bits": 16
+      },
+      "score_fmt": {
+        "name": "Q22.16",
+        "signed": true,
+        "total_bits": 38,
+        "frac_bits": 16
+      },
+      "m_fmt": {
+        "name": "Q22.16",
+        "signed": true,
+        "total_bits": 38,
+        "frac_bits": 16
+      },
+      "log2e_fmt": {
+        "name": "Q2.16",
+        "signed": true,
+        "total_bits": 18,
+        "frac_bits": 16
+      },
+      "exp_fmt": {
+        "name": "UQ1.23",
+        "signed": false,
+        "total_bits": 24,
+        "frac_bits": 23
+      },
+      "locall_fmt": {
+        "name": "UQ5.23",
+        "signed": false,
+        "total_bits": 28,
+        "frac_bits": 23
+      },
+      "l_fmt": {
+        "name": "UQ9.23",
+        "signed": false,
+        "total_bits": 32,
+        "frac_bits": 23
+      },
+      "localo_fmt": {
+        "name": "Q12.23",
+        "signed": true,
+        "total_bits": 35,
+        "frac_bits": 23
+      },
+      "oacc_fmt": {
+        "name": "Q16.23",
+        "signed": true,
+        "total_bits": 39,
+        "frac_bits": 23
+      }
+    }
+  },
+  "data": {
+    "seed": 42,
+    "value_range": [-1.0, 1.0]
+  },
+  "debug": {
+    "model_debug_print": false,
+    "dump_debug": true,
+    "debug_dir": "debug_logs/run_001",
+    "dump_hex": true
+  },
+  "report": {
+    "print_summary": false
+  },
+  "targets": {
+    "mean_abs_error": 0.03,
+    "max_abs_error": 0.10
+  }
+}

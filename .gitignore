@@ -32,3 +32,6 @@ __pycache__/
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Modle
+model/debug_logs

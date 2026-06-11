@@ -1,0 +1,2 @@
+candidate_id,passed,error,total_internal_bits,score_frac,prob_frac,worst_mean_abs_error,worst_max_abs_error,worst_rmse,s_fmt,score_fmt,m_fmt,log2e_fmt,exp_fmt,locall_fmt,l_fmt,localo_fmt,oacc_fmt
+score_f12_prob_f12,True,,215,12,12,0.00016695874835413637,0.05644679012299747,0.001720862368432083,signed Q22.12,signed Q19.12,signed Q19.12,signed Q2.12,UQ1.12,UQ5.12,UQ9.12,signed Q13.12,signed Q17.12
